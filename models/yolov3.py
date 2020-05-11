@@ -78,7 +78,7 @@ class YOLOV3(nn.Module):
                      [[10, 13], [16, 30], [33, 23]],
                  ]):
         super(YOLOV3, self).__init__()
-        self.stages = resnet34(pretrained=True).stages
+        self.backbone = resnet34(pretrained=True)
 
         depth = 3
         width = 512
@@ -107,16 +107,8 @@ class YOLOV3(nn.Module):
     def forward(self, x):
         img_size = x.shape[-2:]
 
-        x = self.stages[0](x)
-        x = self.stages[1](x)
-        x = self.stages[2](x)
-        x1 = x
-        x = self.stages[3](x)
-        x2 = x
-        x = self.stages[4](x)
-        x = self.spp(x)
-        x3 = x
-        features = [x3, x2, x1]
+        features = self.backbone(x)
+        features = [self.spp(features[-1]), features[-2], features[-3]]
         features = self.fpn(features)
         features = [
             head(feature) for feature, head in zip(features, self.head)
