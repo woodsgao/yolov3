@@ -10,14 +10,6 @@ import torch.nn as nn
 from pytorch_modules.nn import FocalBCELoss
 
 
-def load_classes(path):
-    # Loads *.names file at 'path'
-    with open(path, 'r') as f:
-        names = f.read().split('\n')
-    return list(filter(
-        None, names))  # filter removes empty strings (such as last line)
-
-
 def xyxy2xywh(x):
     # Convert bounding box format from [x1, y1, x2, y2] to [x, y, w, h]
     y = torch.zeros_like(x) if isinstance(x,
