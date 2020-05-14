@@ -80,8 +80,8 @@ class YOLOV3(nn.Module):
         super(YOLOV3, self).__init__()
         self.backbone = resnet34(pretrained=True)
 
-        depth = 3
-        width = 512
+        depth = 5
+        width = [512, 256, 128]
         planes_list = [512 * 4, 256, 128]
         self.spp = SPP()
         self.fpn = FPN(planes_list, width, depth)
@@ -90,8 +90,8 @@ class YOLOV3(nn.Module):
         for i in range(3):
             self.head.append(
                 nn.Sequential(
-                    ConvNormAct(width, width),
-                    nn.Conv2d(width,
+                    ConvNormAct(width[i], width[i]),
+                    nn.Conv2d(width[i],
                               len(anchors[i]) * (5 + num_classes), 1),
                 ))
             self.yolo_layers.append(

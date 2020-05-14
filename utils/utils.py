@@ -1,5 +1,4 @@
 import random
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -445,6 +444,34 @@ def apply_classifier(x, model, img, im0):
 
 
 # Plotting functions ---------------------------------------------------------------------------------------------------
+def show_target(inputs, targets):
+    imgs = inputs.clone()[:8]
+    bboxes = targets
+    imgs *= torch.FloatTensor([58.395, 57.12,
+                               57.375]).reshape(1, 3, 1, 1).to(imgs.device)
+    imgs += torch.FloatTensor([123.675, 116.28,
+                               103.53]).reshape(1, 3, 1, 1).to(imgs.device)
+
+    imgs = imgs.clamp(0, 255).permute(0, 2, 3,
+                                      1).byte().cpu().numpy()[..., ::-1]
+    imgs = np.ascontiguousarray(imgs)
+    for i in range(len(bboxes)):
+        ii = int(bboxes[i, 0])
+        if ii >= len(imgs):
+            continue
+        img = imgs[ii]
+        xywh = bboxes[i:i + 1, 2:]
+        xywh[:, (0, 2)] *= img.shape[1]
+        xywh[:, (1, 3)] *= img.shape[0]
+        xyxy = xywh2xyxy(xywh)
+        plot_one_box(xyxy[0], img)
+        imgs[ii] = img
+    imgs = imgs.reshape(-1, imgs.shape[2], imgs.shape[3])
+
+    save_img = imgs
+    cv2.imwrite('batch.png', save_img)
+
+
 def show_batch(inputs, targets):
     imgs = inputs.clone()[:8]
     bboxes = targets[:8]
