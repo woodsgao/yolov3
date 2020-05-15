@@ -1,15 +1,17 @@
-import os.path as osp
 import argparse
+import os.path as osp
+
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
-from tqdm import tqdm
-from models import YOLOV3
-from utils.datasets import CocoDataset
 from torch.utils.data import DataLoader
-from pytorch_modules.utils import device, Fetcher
-from pytorch_modules.utils import device
-from utils.utils import compute_loss, non_max_suppression, clip_coords, xywh2xyxy, bbox_iou, ap_per_class, show_batch
+from tqdm import tqdm
+
+from models import YOLOV3
+from pytorch_modules.utils import Fetcher, device
+from utils.datasets import CocoDataset
+from utils.utils import (ap_per_class, bbox_iou, clip_coords, compute_loss,
+                         non_max_suppression, show_batch, xywh2xyxy)
 
 
 @torch.no_grad()
@@ -21,7 +23,7 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
     seen = 0
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP',
                                  'F1')
-    p, r, f1, mp, mr, map, mf1 = 0., 0., 0., 0., 0., 0., 0.
+    p, r, f1, mp, mr, mAP, mf1 = 0., 0., 0., 0., 0., 0., 0.
     jdict, stats, ap, ap_class = [], [], [], []
     pbar = tqdm(enumerate(fetcher), total=len(fetcher))
     for idx, (imgs, targets) in pbar:
@@ -41,7 +43,6 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
         # Plot images with bounding boxes
         if idx == 0:
             show_batch(imgs, output)
-
 
         # Statistics per image
         for si, pred in enumerate(output):
@@ -95,15 +96,42 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
                         detected.append(m[bi])
 
             # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct, pred[:, 4].cpu(), pred[:, 6].cpu(), tcls))
+            stats.append((correct, pred[:, 4].cpu().numpy(), pred[:, 6].cpu().numpy(), tcls))
         pbar.set_description('loss: %8g' % (val_loss / (idx + 1)))
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in list(zip(*stats))]
 
+    # sync stats
+    if dist.is_initialized():
+        for i in range(len(stats)):
+            stat = torch.FloatTensor(stats[i]).to(device)
+            ls = torch.IntTensor([len(stat)]).to(device)
+            ls_list = [
+                torch.IntTensor([0]).to(device)
+                for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather(ls_list, ls)
+            ls_list = [ls_item.item() for ls_item in ls_list]
+            max_ls = max(ls_list)
+            if len(stat) < max_ls:
+                stat = torch.cat(
+                    [stat, torch.zeros(max_ls - len(stat)).to(device)])
+            stat_list = [
+                torch.zeros(max_ls).to(device)
+                for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather(stat_list, stat)
+            stat_list = [
+                stat_list[si][:ls_list[si]]
+                for si in range(dist.get_world_size()) if ls_list[si] > 0
+            ]
+            stat = torch.cat(stat_list)
+            stats[i] = stat.cpu().numpy()
+
     if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
-        mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+        mp, mr, mAP, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
         nt = np.bincount(stats[3].astype(np.int64),
                          minlength=num_classes)  # number of targets per class
     else:
@@ -111,26 +139,27 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
 
     # Print results
     pf = '%20s' + '%10.3g' * 6  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
+    print(pf % ('all', seen, nt.sum(), mp, mr, mAP, mf1))
 
     # Print results per class
     for i, c in enumerate(ap_class):
         print(pf % (classes[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
     # Return results
-    maps = np.zeros(num_classes) + map
+    mAPs = np.zeros(num_classes) + mAP
     for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    # return (mp, mr, map, mf1, *(loss / len(dataloader)).tolist()), maps
+        mAPs[c] = ap[i]
+    # return (mp, mr, mAP, mf1, *(loss / len(dataloader)).tolist()), mAPs
     print(val_loss / len(fetcher))
-    return map
+    return mAP
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--val-list', type=str, default='data/voc/valid.txt')
-    parser.add_argument('--img-size', type=str, default='512')
-    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('val', type=str)
     parser.add_argument('--weights', type=str, default='')
+    parser.add_argument('--rect', action='store_true')
+    parser.add_argument('--img-size', type=str, default='416')
+    parser.add_argument('-bs', '--batch-size', type=int, default=32)
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--iou-thres',
                         type=float,
@@ -144,6 +173,7 @@ if __name__ == '__main__':
                         type=float,
                         default=0.5,
                         help='iou threshold for non-maximum suppression')
+
     opt = parser.parse_args()
 
     img_size = opt.img_size.split(',')
@@ -153,17 +183,24 @@ if __name__ == '__main__':
     else:
         img_size = [int(x) for x in img_size]
 
-    val_data = CocoDataset(opt.val_list, img_size=tuple(img_size))
+    val_data = CocoDataset(opt.val,
+                           img_size=img_size,
+                           augments=None,
+                           rect=opt.rect)
     val_loader = DataLoader(
         val_data,
         batch_size=opt.batch_size,
         pin_memory=True,
         num_workers=opt.num_workers,
+        collate_fn=CocoDataset.collate_fn,
     )
     val_fetcher = Fetcher(val_loader, post_fetch_fn=val_data.post_fetch_fn)
-    model = YOLOV3(80)
+    model = YOLOV3(opt.num_classes)
     if opt.weights:
         state_dict = torch.load(opt.weights, map_location='cpu')
         model.load_state_dict(state_dict['model'])
-    metrics = test(model, val_fetcher, conf_thres=opt.conf_thres, nms_thres=opt.nms_thres)
+    metrics = test(model,
+                   val_fetcher,
+                   conf_thres=opt.conf_thres,
+                   nms_thres=opt.nms_thres)
     print('metrics: %8g' % (metrics))
