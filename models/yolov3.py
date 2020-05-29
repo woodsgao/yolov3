@@ -4,10 +4,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.quantization import DeQuantStub, QuantStub
 
-from pytorch_modules.backbones import resnet34, resnet50
-from pytorch_modules.nn import ConvNormAct
-from pytorch_modules.utils import initialize_weights
+from pytorch_modules.backbones import (mobilenet_v2, resnet34, resnet50,
+                                       resnext50_32x4d)
+from pytorch_modules.backbones.mobilenet import ConvBNReLU, InvertedResidual
+from pytorch_modules.nn import ConvNormAct, SeparableConvNormAct
+from pytorch_modules.utils import initialize_weights, replace_relu6
 
 from .fpn import FPN
 from .spp import SPP
@@ -78,19 +81,21 @@ class YOLOV3(nn.Module):
                      [[10, 13], [16, 30], [33, 23]],
                  ]):
         super(YOLOV3, self).__init__()
-        self.backbone = resnet34(pretrained=True)
-
+        self.backbone = mobilenet_v2(pretrained=True)
         depth = 5
         width = [512, 256, 128]
-        planes_list = [512 * 4, 256, 128]
-        self.spp = SPP()
+        planes_list = [1280, 96, 32]
+        self.spp = nn.Sequential(
+            ConvNormAct(1280, 320, 1, activate=nn.ReLU(True)), SPP())
         self.fpn = FPN(planes_list, width, depth)
         self.head = nn.ModuleList([])
         self.yolo_layers = nn.ModuleList([])
         for i in range(3):
             self.head.append(
                 nn.Sequential(
-                    ConvNormAct(width[i], width[i]),
+                    SeparableConvNormAct(width[i],
+                                         width[i],
+                                         activate=nn.ReLU(True)),
                     nn.Conv2d(width[i],
                               len(anchors[i]) * (5 + num_classes), 1),
                 ))
@@ -106,15 +111,20 @@ class YOLOV3(nn.Module):
 
     def forward(self, x):
         img_size = x.shape[-2:]
-
+        if hasattr(self, 'quant'):
+            x = self.quant(x)
+            # print(x)
         features = self.backbone(x)
+        # features = [features[-1], features[-2], features[-3]]
         features = [self.spp(features[-1]), features[-2], features[-3]]
         features = self.fpn(features)
         features = [
             head(feature) for feature, head in zip(features, self.head)
         ]
         if os.environ.get('CAFFE_EXPORT'):
-            return None
+            return features
+        if hasattr(self, 'dequant'):
+            features = [self.dequant(feature) for feature in features]
         output = [
             yolo(feature, img_size)
             for feature, yolo in zip(features, self.yolo_layers)
@@ -124,6 +134,21 @@ class YOLOV3(nn.Module):
         else:
             io, p = list(zip(*output))  # inference output, training output
             return torch.cat(io, 1), p
+
+    def fuse_model(self):
+        # replace_relu6(self)
+        for m in self.modules():
+            if type(m) == ConvBNReLU:
+                torch.quantization.fuse_modules(m, ['0', '1', '2'],
+                                                inplace=True)
+            if type(m) == ConvNormAct:
+                torch.quantization.fuse_modules(m, ['0', '1', '2'],
+                                                inplace=True)
+            if type(m) == InvertedResidual:
+                for idx in range(len(m.conv)):
+                    if type(m.conv[idx]) == nn.Conv2d:
+                        torch.quantization.fuse_modules(
+                            m.conv, [str(idx), str(idx + 1)], inplace=True)
 
 
 def create_grids(self,
