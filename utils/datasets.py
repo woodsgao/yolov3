@@ -13,6 +13,8 @@ from imgaug.augmentables.polys import Polygon, PolygonsOnImage
 
 from pytorch_modules.utils import IMG_EXT
 
+POINTS_WH = 30
+
 # Sometimes(0.5, ...) applies the given augmenter in 50% of all cases,
 # e.g. Sometimes(0.5, GaussianBlur(0.3)) would blur roughly every second image.
 sometimes = lambda aug: iaa.Sometimes(0.5, aug)
@@ -146,13 +148,17 @@ class BasicDataset(torch.utils.data.Dataset):
         img, bboxes = self.get_item(idx)
         img = img.transpose(2, 0, 1)
         img = np.ascontiguousarray(img)
-        x1 = bboxes[:, 2::2].min(1)
-        x2 = bboxes[:, 2::2].max(1)
-        y1 = bboxes[:, 3::2].min(1)
-        y2 = bboxes[:, 3::2].max(1)
-        
-        xywh = np.stack([(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1], 1)
-        bboxes = np.concatenate([bboxes[:, :2], xywh], 1)
+        x1 = np.float32([min(label[2::2]) for label in bboxes])
+        x2 = np.float32([max(label[2::2]) for label in bboxes])
+        y1 = np.float32([min(label[3::2]) for label in bboxes])
+        y2 = np.float32([max(label[3::2]) for label in bboxes])
+
+        xywh = np.stack([(x1 + x2) / 2.0, (y1 + y2) / 2.0, x2 - x1, y2 - y1],
+                        1)
+        cid = np.float32([label[:2]
+                          for label in bboxes]) if len(bboxes) else np.zeros(
+                              (0, 2))
+        bboxes = np.concatenate([cid, xywh], 1)
         img, bboxes = torch.ByteTensor(img), torch.FloatTensor(bboxes)
         return img, bboxes
 
@@ -199,10 +205,6 @@ class BasicDataset(torch.utils.data.Dataset):
                 continue
             c = polygon.label
             labels.append([0, c] + p.reshape(-1).tolist())
-        if len(labels):
-            labels = np.float32(labels)
-        else:
-            labels = np.zeros([0, 10], dtype=np.float32)
         if self.mosaic and mosaic and random.random() < 0.2:
             mosaic_list = [(img, labels)]
             for _ in range(3):
@@ -221,21 +223,44 @@ class BasicDataset(torch.utils.data.Dataset):
             img2 = np.concatenate([img2, img3], 1)
             img = np.concatenate([img0, img2], 0)
             labels0 = mosaic_list[0][1]
-            labels0 = labels0[labels0[:, 2::2].max(1) < cut_x_ratio]
-            labels0 = labels0[labels0[:, 3::2].max(1) < cut_y_ratio]
+            labels0 = [
+                label for label in labels0 if max(label[2::2]) < cut_x_ratio
+            ]
+            labels0 = [
+                label for label in labels0 if max(label[3::2]) < cut_y_ratio
+            ]
             labels1 = mosaic_list[1][1]
-            labels1 = labels1[labels1[:, 2::2].min(1) > cut_x_ratio]
-            labels1 = labels1[labels1[:, 3::2].max(1) < cut_y_ratio]
+            labels1 = [
+                label for label in labels1 if min(label[2::2]) > cut_x_ratio
+            ]
+            labels1 = [
+                label for label in labels1 if max(label[3::2]) < cut_y_ratio
+            ]
             labels2 = mosaic_list[2][1]
-            labels2 = labels2[labels2[:, 2::2].max(1) < cut_x_ratio]
-            labels2 = labels2[labels2[:, 3::2].min(1) > cut_y_ratio]
+            labels2 = [
+                label for label in labels2 if max(label[2::2]) < cut_x_ratio
+            ]
+            labels2 = [
+                label for label in labels2 if min(label[3::2]) > cut_y_ratio
+            ]
             labels3 = mosaic_list[3][1]
-            labels3 = labels3[labels3[:, 2::2].min(1) > cut_x_ratio]
-            labels3 = labels3[labels3[:, 3::2].min(1) > cut_y_ratio]
-            labels = np.concatenate([labels0, labels1, labels2, labels3], 0)
+            labels3 = [
+                label for label in labels3 if min(label[2::2]) > cut_x_ratio
+            ]
+            labels3 = [
+                label for label in labels3 if min(label[3::2]) > cut_y_ratio
+            ]
+            # labels = np.concatenate([labels0, labels1, labels2, labels3], 0)
+            labels = labels0 + labels1 + labels2 + labels3
         # filter small items
-        labels = labels[labels[:, 2::2].max(1) - labels[:, 2::2].min(1) > 3e-3]
-        labels = labels[labels[:, 3::2].max(1) - labels[:, 3::2].min(1) > 3e-3]
+        labels = [
+            label for label in labels
+            if max(label[::2]) - min(label[2::2]) > 3e-3
+        ]
+        labels = [
+            label for label in labels
+            if max(label[::2]) - min(label[3::2]) > 3e-3
+        ]
         return img, labels
 
     def __len__(self):
@@ -386,9 +411,26 @@ class CocoDataset(BasicDataset):
         anns = self.data[idx][1]
         polygons = []
         for ann in anns:
-            polygons.append(
-                Polygon(
-                    np.float32(ann['segmentation']).reshape(-1, 2),
-                    ann['category_id']))
+            if len(ann['segmentation'][0]) > 4:
+                polygons.append(
+                    Polygon(
+                        np.float32(ann['segmentation']).reshape(-1, 2),
+                        ann['category_id']))
+            elif len(ann['segmentation'][0]) == 2:
+                # point
+                polygons.append(
+                    Polygon(
+                        np.float32([
+                            ann['segmentation'][0][0] - POINTS_WH / 2,
+                            ann['segmentation'][0][1] - POINTS_WH / 2,
+                            ann['segmentation'][0][0] - POINTS_WH / 2,
+                            ann['segmentation'][0][1] + POINTS_WH / 2,
+                            ann['segmentation'][0][0] + POINTS_WH / 2,
+                            ann['segmentation'][0][1] + POINTS_WH / 2,
+                            ann['segmentation'][0][0] + POINTS_WH / 2,
+                            ann['segmentation'][0][1] - POINTS_WH / 2
+                        ]).reshape(-1, 2), ann['category_id']))
+            else:
+                print(len(ann['segmentation'][0]))
         polygons = PolygonsOnImage(polygons, img.shape)
         return img, polygons
