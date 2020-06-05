@@ -90,8 +90,8 @@ if __name__ == "__main__":
                         type=int,
                         nargs=2,
                         default=[416, 416])
-    parser.add_argument('-bs', '--batch-size', type=int, default=4)
-    parser.add_argument('-a', '--accumulate', type=int, default=8)
+    parser.add_argument('-bs', '--batch-size', type=int, default=32)
+    parser.add_argument('-a', '--accumulate', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--adam', action='store_true')
     parser.add_argument('--resume', action='store_true')
