@@ -121,7 +121,7 @@ class YOLOV3(nn.Module):
         features = [
             head(feature) for feature, head in zip(features, self.head)
         ]
-        if os.environ.get('CAFFE_EXPORT'):
+        if os.environ.get('MODEL_EXPORT'):
             return features
         if hasattr(self, 'dequant'):
             features = [self.dequant(feature) for feature in features]

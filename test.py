@@ -158,35 +158,27 @@ if __name__ == '__main__':
     parser.add_argument('val', type=str)
     parser.add_argument('--weights', type=str, default='')
     parser.add_argument('--rect', action='store_true')
-    parser.add_argument('--img-size', type=str, default='416')
+    parser.add_argument('-s',
+                        '--img_size',
+                        type=int,
+                        nargs=2,
+                        default=[416, 416])
     parser.add_argument('-bs', '--batch-size', type=int, default=32)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--iou-thres',
-                        type=float,
-                        default=0.5,
-                        help='iou threshold required to qualify as detected')
     parser.add_argument('--conf-thres',
                         type=float,
-                        default=0.001,
+                        default=0.1,
                         help='object confidence threshold')
     parser.add_argument('--nms-thres',
                         type=float,
                         default=0.5,
                         help='iou threshold for non-maximum suppression')
-
     opt = parser.parse_args()
 
-    img_size = opt.img_size.split(',')
-    assert len(img_size) in [1, 2]
-    if len(img_size) == 1:
-        img_size = [int(img_size[0])] * 2
-    else:
-        img_size = [int(x) for x in img_size]
-
     val_data = CocoDataset(opt.val,
-                           img_size=img_size,
-                           augments=None,
-                           rect=opt.rect)
+                          img_size=opt.img_size,
+                          augments=None,
+                          rect=opt.rect)
     val_loader = DataLoader(
         val_data,
         batch_size=opt.batch_size,
@@ -195,7 +187,7 @@ if __name__ == '__main__':
         collate_fn=CocoDataset.collate_fn,
     )
     val_fetcher = Fetcher(val_loader, post_fetch_fn=val_data.post_fetch_fn)
-    model = YOLOV3(opt.num_classes)
+    model = YOLOV3(len(val_data.classes))
     if opt.weights:
         state_dict = torch.load(opt.weights, map_location='cpu')
         model.load_state_dict(state_dict['model'])
