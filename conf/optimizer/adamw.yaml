@@ -1,0 +1,13 @@
+optimizer:
+  class_name: torch.optim.AdamW
+  module: 
+  params:
+    lr: 1e-4
+    weight_decay: 0.001
+  scheduler: 
+    - class_name: torch.optim.lr_scheduler.CosineAnnealingLR
+      params:
+        T_max: 10
+    - class_name: pytorch_modules.optim.lr_scheduler.WarmupLR
+      params:
+        steps: 10

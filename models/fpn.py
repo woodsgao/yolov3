@@ -6,55 +6,50 @@ from pytorch_modules.nn.utils import ConvNormAct, SeparableConvNormAct
 
 
 class FPN(nn.Module):
-    def __init__(self, channels_list, out_channels=[512, 256, 128], reps=3):
-        """[summary]
+    def __init__(self,
+                 in_features,
+                 in_channels,
+                 out_channels=[128, 256, 512],
+                 reps=3):
+        """
         
         Arguments:
-            channels_list {list} -- channels of feature maps, from high levels to low levels
+            in_features (list): index of the input features you need.
+            in_channels (list): channels of input features.
         
         Keyword Arguments:
-            out_channels {list} -- out channels  (default: {[512, 256, 128]})
-            reps {int} -- repeat times (default: {3})
+            out_channels (list): channels_output features  (default: {[128, 256, 512]})
+            reps (int) -- repeat times (default: {3})
         """
         super(FPN, self).__init__()
+        self.in_features = in_features
         self.fpn_list = nn.ModuleList([])
         self.trans = nn.ModuleList([])
         self.intrans = nn.ModuleList([])
-        self.relu = nn.ReLU(True)
         last_channels = 0
-        for i in range(len(channels_list)):
+        in_channels = list(in_channels)
+        in_channels.reverse()
+        out_channels = list(out_channels)
+        out_channels.reverse()
+        for i in range(len(in_channels)):
             if i > 0:
                 self.trans.append(
-                    ConvNormAct(last_channels,
-                                out_channels[i],
-                                1,
-                                activate=nn.ReLU(True)))
+                    ConvNormAct(last_channels, out_channels[i], 1))
                 last_channels = out_channels[i]
-            self.intrans.append(
-                ConvNormAct(channels_list[i],
-                            out_channels[i],
-                            1,
-                            activate=nn.ReLU(True)))
-            in_channels = out_channels[i] + last_channels
-            fpn = [
-                ConvNormAct(in_channels,
-                            out_channels[i],
-                            1,
-                            activate=nn.ReLU(True))
-            ]
+            self.intrans.append(ConvNormAct(in_channels[i], out_channels[i], 1))
+            last_channels += out_channels[i]
+            fpn = [ConvNormAct(last_channels, out_channels[i], 1)]
             fpn += [
-                SeparableConvNormAct(out_channels[i],
-                                     out_channels[i],
-                                     mid_activate=nn.ReLU(True),
-                                     activate=nn.ReLU(True))
-                for rep in range(reps)
+                ConvNormAct(out_channels[i], out_channels[i])
+                for _ in range(reps)
             ]
             fpn = nn.Sequential(*fpn)
             self.fpn_list.append(fpn)
             last_channels = out_channels[i]
-        # self.float_functional = nn.quantized.FloatFunctional()
 
     def forward(self, features):
+        features = [features[i] for i in self.in_features]
+        features.reverse()
         features = [self.intrans[i](f) for i, f in enumerate(features)]
         new_features = []
         for i in range(len(self.fpn_list)):
@@ -65,11 +60,8 @@ class FPN(nn.Module):
                                              scale_factor=2,
                                              mode='bilinear',
                                              align_corners=False)
-                if hasattr(self, 'float_functional'):
-                    feature = self.float_functional.cat(
-                        [last_feature, feature], 1)
-                else:
-                    feature = torch.cat([last_feature, feature], 1)
+                feature = torch.cat([last_feature, feature], 1)
             feature = self.fpn_list[i](feature)
             new_features.append(feature)
+        new_features.reverse()
         return new_features

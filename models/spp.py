@@ -3,18 +3,17 @@ import torch.nn as nn
 
 
 class SPP(nn.Module):
-    def __init__(self, sizes=[5, 9, 13]):
+    def __init__(self, in_feature_id=-1, sizes=[5, 9, 13]):
         super(SPP, self).__init__()
+        self.in_feature_id = in_feature_id
         self.pools = nn.ModuleList(
             [nn.MaxPool2d(size, 1, padding=(size - 1) // 2) for size in sizes])
-        # self.float_functional = nn.quantized.FloatFunctional()
 
-    def forward(self, x):
-        features = [x]
+    def forward(self, in_features):
+        x = in_features[self.in_feature_id]
+        feature_list = [x]
         for pool in self.pools:
-            features.append(pool(x))
-        if hasattr(self, 'float_functional'):
-            features = self.float_functional.cat(features, 1)
-        else:
-            features = torch.cat(features, 1)
-        return features
+            feature_list.append(pool(x))
+        feature = torch.cat(feature_list, 1)
+        in_features[self.in_feature_id] = feature
+        return in_features

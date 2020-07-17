@@ -1,0 +1,13 @@
+defaults:
+  - data: coco
+  - trainer: default
+  - logging: tensorboard
+  - optimizer: adamw
+  - model: r50_yolov3
+  - callbacks: callbacks
+  - checkpoint: default
+
+general:
+  save_dir: logs/
+  workspace: workspace/
+  project_name: yolov3

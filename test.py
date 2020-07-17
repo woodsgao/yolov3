@@ -56,10 +56,6 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
                     stats.append(([], torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
-            # Append to text file
-            # with open('test.txt', 'a') as file:
-            #    [file.write('%11.5g' * 7 % tuple(x) + '\n') for x in pred]
-
             # Clip boxes to image bounds
             clip_coords(pred, (height, width))
 
@@ -149,7 +145,6 @@ def test(model, fetcher, conf_thres=1e-3, nms_thres=0.5):
     for i, c in enumerate(ap_class):
         mAPs[c] = ap[i]
     # return (mp, mr, mAP, mf1, *(loss / len(dataloader)).tolist()), mAPs
-    print(val_loss / len(fetcher))
     return mAP
 
 

@@ -17,13 +17,13 @@
 
 tmp/
 output/
+outputs/
 *.caffemodel
 *.prototxt
 *.pt
 *.pth
 
 runs/
-data/
 .vscode/
 .github/
 

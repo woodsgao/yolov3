@@ -194,22 +194,24 @@ def wh_iou(box1, box2):
     return inter_area / union_area  # iou
 
 
-def compute_loss(p, targets, model):  # predictions, targets, model
-    ft = torch.cuda.FloatTensor if p[0].is_cuda else torch.Tensor
-    lcls, lbox, lobj = ft([0]), ft([0]), ft([0])
+def compute_loss(preds, targets, model):  # predictions, targets, model
+    lcls = torch.FloatTensor([0]).to(preds[0].device)
+    lbox = torch.FloatTensor([0]).to(preds[0].device)
+    lobj = torch.FloatTensor([0]).to(preds[0].device)
+    
     tcls, tbox, indices, anchor_vec = build_targets(model, targets)
     # Define criteria
     BCE = nn.BCELoss()
-    BCE = FocalBCELoss()
+    obj_bce = [FocalBCELoss(alpha=0.5), FocalBCELoss(alpha=0.5), FocalBCELoss(alpha=0.25)]
     # Compute losses
-    for i, pi in enumerate(p):  # layer index, layer predictions
+    for i, pred in enumerate(preds):  # layer index, layer predictions
         b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-        tobj = torch.zeros_like(pi[..., 0])  # target obj
+        tobj = torch.zeros_like(pred[..., 0])  # target obj
 
         # Compute losses
         nb = len(b)
         if nb:  # number of targets
-            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+            ps = pred[b, a, gj, gi]  # prediction subset corresponding to targets
             tobj[b, a, gj, gi] = 1.0  # obj
             # ps[:, 2:4] = torch.sigmoid(ps[:, 2:4])  # wh power loss (uncomment)
 
@@ -224,23 +226,16 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             t = torch.zeros_like(ps[:, 5:])  # targets
             t[range(nb), tcls[i]] = 1.0
             lcls += BCE(ps[:, 5:].sigmoid(), t).mean()  # BCE
-
-        bce = BCE(pi[..., 4].sigmoid(), tobj)
+        bce = obj_bce[i](pred[..., 4].sigmoid(), tobj) * (2**i)
         lobj += bce  # obj loss
 
-    lbox *= 3.54
-    lobj *= 64.3
-    lcls *= 37.4
-    loss = lbox + lobj + lcls
-    return loss
+    return lbox, lobj, lcls
 
 
 def build_targets(model, targets):
     # targets = [image, class, x, y, w, h]
-    if dist.is_initialized():
-        yolo_layers = model.module.yolo_layers
-    else:
-        yolo_layers = model.yolo_layers
+
+    yolo_layers = model.head
     nt = len(targets)
     tcls, tbox, indices, av = [], [], [], []
     for i in yolo_layers:

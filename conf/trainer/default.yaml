@@ -1,0 +1,7 @@
+trainer:
+  gpus: 2
+  distributed_backend: ddp
+  accumulate_grad_batches: 4
+  max_epochs: 100
+  # limit_val_batches: 0.0
+  check_val_every_n_epoch: 10

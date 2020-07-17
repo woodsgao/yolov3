@@ -24,8 +24,8 @@ def train(data_dir, epochs, img_size, batch_size, accumulate, lr, adam, resume,
                              img_size=img_size,
                              multi_scale=multi_scale,
                              rect=rect,
-                             with_label=False,
-                             mosaic=True)
+                             with_label=True,
+                             mosaic=False)
     train_loader = DataLoader(
         train_data,
         batch_size=batch_size,

@@ -1,0 +1,21 @@
+data:
+  train: 
+    class_name: utils.datasets.CocoDataset
+    params:
+      path: /home/uisee/data/datasets/coco/annotations/instances_train2014.json
+      img_root: /home/uisee/data/datasets/coco/train2014
+      img_size: [416, 416]
+      rect: False
+      with_label: False
+      mosaic: False  
+  val: 
+    class_name: utils.datasets.CocoDataset
+    params:
+      path: /home/uisee/data/datasets/coco/annotations/instances_val2014.json
+      img_root: /home/uisee/data/datasets/coco/val2014
+      img_size: [416, 416]
+      rect: False
+      with_label: False
+      mosaic: False
+  num_workers: 8
+  batch_size: 20

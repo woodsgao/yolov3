@@ -1,0 +1,2 @@
+callbacks:
+  - class_name: pytorch_lightning.callbacks.LearningRateLogger

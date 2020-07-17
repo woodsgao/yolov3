@@ -1,182 +1,187 @@
+import itertools
 import os
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.quantization import DeQuantStub, QuantStub
 
-from pytorch_modules.backbones import (mobilenet_v2, resnet34, resnet50,
-                                       resnext50_32x4d)
-from pytorch_modules.backbones.mobilenet import ConvBNReLU, InvertedResidual
-from pytorch_modules.nn import ConvNormAct, SeparableConvNormAct
-from pytorch_modules.utils import initialize_weights, replace_relu6
+from pytorch_modules.engine import BasicLitModel
 
-from .fpn import FPN
-from .spp import SPP
+from .utils import (ap_per_class, bbox_iou, clip_coords, compute_loss,
+                    non_max_suppression, show_batch, xywh2xyxy)
 
 
-class YOLOLayer(nn.Module):
-    def __init__(self, anchors, nc, img_size, yolo_index):
-        super(YOLOLayer, self).__init__()
+class YOLOV3(BasicLitModel):
+    """
+    YOLOv3 object detection model
+    """
 
-        self.anchors = torch.Tensor(anchors)
-        self.na = len(anchors)  # number of anchors (3)
-        self.nc = nc  # number of classes (80)
-        self.nx = 0  # initialize number of x gridpoints
-        self.ny = 0  # initialize number of y gridpoints
-
-    def forward(self, p, img_size):
-        bs, ny, nx = p.shape[0], p.shape[-2], p.shape[-1]
-        if (self.nx, self.ny) != (nx, ny):
-            create_grids(self, img_size, (nx, ny), p.device, p.dtype)
-
-        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.na, self.nc + 5, self.ny,
-                   self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
-
-        if self.training:
-            return p
-
-        # p = p.view(1, -1, 5 + self.nc)
-        # xy = torch.sigmoid(p[..., 0:2]) + grid_xy  # x, y
-        # wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
-        # p_conf = torch.sigmoid(p[..., 4:5])  # Conf
-        # p_cls = p[..., 5:5 + self.nc]
-        # # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
-        # # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
-        # p_cls = torch.exp(p_cls).permute((2, 1, 0))
-        # p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
-        # p_cls = p_cls.permute(2, 1, 0)
-        # return torch.cat((xy / ngu, wh, p_conf, p_cls), 2).squeeze().t()
-
-        else:  # inference
-            # s = 1.5  # scale_xy  (pxy = pxy * s - (s - 1) / 2)
-            io = p.clone()  # inference output
-            io[..., 0:2] = torch.sigmoid(io[..., 0:2]) + self.grid_xy  # xy
-            io[..., 2:4] = torch.exp(
-                io[..., 2:4]) * self.anchor_wh  # wh yolo method
-            # io[..., 2:4] = ((torch.sigmoid(io[..., 2:4]) * 2) ** 3) * self.anchor_wh  # wh power method
-            io[..., :4] *= self.stride
-
-            torch.sigmoid_(io[..., 4:])
-
-            if self.nc == 1:
-                io[...,
-                   5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
-
-            # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
-            return io.view(bs, -1, 5 + self.nc), p
-
-
-class YOLOV3(nn.Module):
-    # YOLOv3 object detection model
-
-    def __init__(self,
-                 num_classes,
-                 img_size=(416, 416),
-                 anchors=[
-                     [[116, 90], [156, 198], [373, 326]],
-                     [[30, 61], [62, 45], [59, 119]],
-                     [[10, 13], [16, 30], [33, 23]],
-                 ]):
-        super(YOLOV3, self).__init__()
-        self.backbone = mobilenet_v2(pretrained=True)
-        depth = 5
-        width = [512, 256, 128]
-        planes_list = [1280, 96, 32]
-        self.spp = nn.Sequential(
-            ConvNormAct(1280, 320, 1, activate=nn.ReLU(True)), SPP())
-        self.fpn = FPN(planes_list, width, depth)
-        self.head = nn.ModuleList([])
-        self.yolo_layers = nn.ModuleList([])
-        for i in range(3):
-            self.head.append(
-                nn.Sequential(
-                    SeparableConvNormAct(width[i],
-                                         width[i],
-                                         activate=nn.ReLU(True)),
-                    nn.Conv2d(width[i],
-                              len(anchors[i]) * (5 + num_classes), 1),
-                ))
-            self.yolo_layers.append(
-                YOLOLayer(
-                    anchors=np.float32(anchors[i]),
-                    nc=num_classes,
-                    img_size=img_size,
-                    yolo_index=i,
-                ))
-        initialize_weights(self.fpn)
-        initialize_weights(self.head)
+    def __init__(self, cfg):
+        super(YOLOV3, self).__init__(cfg)
 
     def forward(self, x):
-        img_size = x.shape[-2:]
-        if hasattr(self, 'quant'):
-            x = self.quant(x)
-            # print(x)
-        features = self.backbone(x)
-        # features = [features[-1], features[-2], features[-3]]
-        features = [self.spp(features[-1]), features[-2], features[-3]]
-        features = self.fpn(features)
-        features = [
-            head(feature) for feature, head in zip(features, self.head)
-        ]
-        if os.environ.get('MODEL_EXPORT'):
-            return features
-        if hasattr(self, 'dequant'):
-            features = [self.dequant(feature) for feature in features]
-        output = [
-            yolo(feature, img_size)
-            for feature, yolo in zip(features, self.yolo_layers)
-        ]
+        output = super(YOLOV3, self).forward(x)
         if self.training:
             return tuple(output)
         else:
             io, p = list(zip(*output))  # inference output, training output
             return torch.cat(io, 1), p
 
-    def fuse_model(self):
-        # replace_relu6(self)
-        for m in self.modules():
-            if type(m) == ConvBNReLU:
-                torch.quantization.fuse_modules(m, ['0', '1', '2'],
-                                                inplace=True)
-            if type(m) == ConvNormAct:
-                torch.quantization.fuse_modules(m, ['0', '1', '2'],
-                                                inplace=True)
-            if type(m) == InvertedResidual:
-                for idx in range(len(m.conv)):
-                    if type(m.conv[idx]) == nn.Conv2d:
-                        torch.quantization.fuse_modules(
-                            m.conv, [str(idx), str(idx + 1)], inplace=True)
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        # separate losses
+        lbox, lobj, lcls = compute_loss(outputs, targets, self.model)
+        lbox *= 3.54
+        lobj *= 64.3
+        lcls *= 37.4
+        # total loss
+        loss = lbox + lobj + lcls
 
+        return {
+            'loss': loss,
+            'log': {
+                'obj_loss': lobj,
+                'cls_loss': lcls,
+                'giou_loss': lbox
+            }
+        }
 
-def create_grids(self,
-                 img_size=416,
-                 ng=(13, 13),
-                 device='cpu',
-                 type=torch.float32):
-    nx, ny = ng  # x and y grid size
-    self.img_size = max(img_size)
-    self.stride = self.img_size / max(ng)
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch
+        _, _, height, width = images.shape
+        inference_outputs, train_outputs = self(images)
+        # separate losses
+        lbox, lobj, lcls = compute_loss(train_outputs, targets, self.model)
+        lbox *= 3.54
+        lobj *= 64.3
+        lcls *= 37.4
+        # total loss
+        loss = lbox + lobj + lcls
 
-    # build xy offsets
-    yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-    self.grid_xy = torch.stack((xv, yv), 2).to(device).type(type).view(
-        (1, 1, ny, nx, 2))
+        bboxes = non_max_suppression(inference_outputs,
+                                     conf_thres=0.001,
+                                     nms_thres=0.5)
+        # Statistics per image
+        stats = []
+        seen = 0
+        for si, pred in enumerate(bboxes):
+            labels = targets[targets[:, 0] == si, 1:]
+            nl = len(labels)
+            tcls = labels[:, 0].tolist() if nl else []  # target class
+            seen += 1
 
-    # build wh gains
-    self.anchor_vec = self.anchors.to(device) / self.stride
-    self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1,
-                                          2).to(device).type(type)
-    self.ng = torch.Tensor(ng).to(device)
-    self.nx = nx
-    self.ny = ny
+            if pred is None:
+                if nl:
+                    stats.append(([], torch.Tensor(), torch.Tensor(), tcls))
+                continue
 
+            # Clip boxes to image bounds
+            clip_coords(pred, (height, width))
 
-if __name__ == '__main__':
-    model = YOLOV3(80)
-    a = torch.rand([4, 3, 416, 416])
-    b = model(a)
-    print(b[0].shape)
-    b[0].mean().backward()
+            # Assign all predictions as incorrect
+            correct = [0] * len(pred)
+            if nl:
+                detected = []
+                tcls_tensor = labels[:, 0]
+
+                # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5])
+                tbox[:, [0, 2]] *= width
+                tbox[:, [1, 3]] *= height
+
+                # Search for correct predictions
+                for i, (*pbox, pconf, pcls_conf, pcls) in enumerate(pred):
+
+                    # Break if all targets already located in image
+                    if len(detected) == nl:
+                        break
+
+                    # Continue if predicted class not among image classes
+                    if pcls.item() not in tcls:
+                        continue
+
+                    # Best iou, index between pred and targets
+                    m = (pcls == tcls_tensor).nonzero().view(-1)
+                    iou, bi = bbox_iou(pbox, tbox[m]).max(0)
+
+                    # If iou > threshold and class is correct mark as correct
+                    if iou > 0.5 and m[
+                            bi] not in detected:  # and pcls == tcls[bi]:
+                        correct[i] = 1
+                        detected.append(m[bi])
+
+            # Append statistics (correct, conf, pcls, tcls)
+            stats.append(
+                (correct, pred[:,
+                               4].cpu().numpy(), pred[:,
+                                                      6].cpu().numpy(), tcls))
+        return {'stats': stats, 'val_loss': loss, 'seen': seen}
+
+    def validation_epoch_end(self, val_outs):
+        classes = self.val_dataset.classes
+        num_classes = len(classes)
+
+        val_loss = list(map(lambda x: x['val_loss'], val_outs))
+        if len(val_loss):
+            val_loss = sum(val_loss) / len(val_loss)
+        else:
+            val_loss = 0
+
+        seen = sum(map(lambda x: x['seen'], val_outs))
+
+        # Compute statistics
+        stats = list(
+            itertools.chain(*list(map(lambda x: x['stats'], val_outs))))
+        stats = [np.concatenate(x, 0) for x in list(zip(*stats))]
+        # sync stats
+        if dist.is_initialized():
+            for i in range(len(stats)):
+                stat = torch.FloatTensor(stats[i]).to(self.device)
+                ls = torch.IntTensor([len(stat)]).to(self.device)
+                ls_list = [
+                    torch.IntTensor([0]).to(self.device)
+                    for _ in range(dist.get_world_size())
+                ]
+                dist.all_gather(ls_list, ls)
+                ls_list = [ls_item.item() for ls_item in ls_list]
+                max_ls = max(ls_list)
+                if len(stat) < max_ls:
+                    stat = torch.cat([
+                        stat,
+                        torch.zeros(max_ls - len(stat)).to(self.device)
+                    ])
+                stat_list = [
+                    torch.zeros(max_ls).to(self.device)
+                    for _ in range(dist.get_world_size())
+                ]
+                dist.all_gather(stat_list, stat)
+                stat_list = [
+                    stat_list[si][:ls_list[si]]
+                    for si in range(dist.get_world_size()) if ls_list[si] > 0
+                ]
+                stat = torch.cat(stat_list)
+                stats[i] = stat.cpu().numpy()
+
+        if len(stats):
+            p, r, ap, f1, ap_class = ap_per_class(*stats)
+            mp, mr, mAP, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+            nt = np.bincount(
+                stats[3].astype(np.int64),
+                minlength=num_classes)  # number of targets per class
+        else:
+            nt = torch.zeros(1)
+
+        # Print results
+        pf = '%20s' + '%10.3g' * 6  # print format
+        print(pf % ('all', seen, nt.sum(), mp, mr, mAP, mf1))
+
+        # Print results per class
+        for i, c in enumerate(ap_class):
+            print(pf % (classes[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
+        return {
+            'mAP': torch.FloatTensor([mAP]),
+            'val_loss': val_loss,
+        }
